@@ -14,6 +14,8 @@
 
 package com.starrocks.connector.flink.manager;
 
+import org.apache.flink.metrics.Histogram;
+import org.apache.flink.runtime.metrics.DescriptiveStatisticsHistogram;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.slf4j.Logger;
@@ -62,14 +64,37 @@ public class StarRocksSinkManager implements Serializable {
     private final Map<String, List<LogicalTypeRoot>> typesMap;
     final LinkedBlockingDeque<Tuple3<String, Long, ArrayList<byte[]>>> flushQueue = new LinkedBlockingDeque<>(1);
 
+    private transient Counter totalFlushCount;
     private transient Counter totalFlushBytes;
     private transient Counter totalFlushRows;
     private transient Counter totalFlushTime;
     private transient Counter totalFlushTimeWithoutRetries;
+    private transient Histogram flushCost;
+    private transient Histogram commitAndPublishTimeMs;
+    private transient Histogram streamLoadPutTimeMs;
+    private transient Histogram readDataTimeMs;
+    private transient Histogram writeDataTimeMs;
+    private transient Histogram loadTimeMs;
+    private transient Counter totalFilteredRows;
+    private transient Counter totalFlushErrorCount;
+    private transient Counter totalOfferTimoutCount;
+    private transient Histogram offerCostMs;
+
+    private static final String COUNTER_TOTAL_FLUSH_COUNT = "totalFlushCount";
     private static final String COUNTER_TOTAL_FLUSH_BYTES = "totalFlushBytes";
     private static final String COUNTER_TOTAL_FLUSH_ROWS = "totalFlushRows";
     private static final String COUNTER_TOTAL_FLUSH_COST_TIME_WITHOUT_RETRIES = "totalFlushTimeNsWithoutRetries";
     private static final String COUNTER_TOTAL_FLUSH_COST_TIME = "totalFlushTimeNs";
+    private static final String HISTOGRAM_FLUSH_COST = "srFlushCost";
+    private static final String HISTOGRAM_COMMIT_AND_PUBLISH_TIME_MS = "srCommitAndPublishTimeMs";
+    private static final String HISTOGRAM_STREAM_LOAD_PUT_TIME_MS = "srStreamLoadPutTimeMs";
+    private static final String HISTOGRAM_READ_DATA_TIME_IN_MS = "srReadDataTimeInMs";
+    private static final String HISTOGRAM_WRITE_DATA_TIME_IN_MS = "srWriteDataTimeInMs";
+    private static final String HISTOGRAM_LOAD_TIME_IN_MS = "srLoadTimeInMs";
+    private static final String COUNTER_TOTAL_FILTERED_ROWS = "srTotalFilteredRows";
+    private static final String COUNTER_TOTAL_FLUSH_ERROR = "srTotalFlushErrorCount";
+    private static final String COUNTER_TOTAL_OFFER_TIMEOUT = "srTotalOfferTimoutCount";
+    private static final String HISTOGRAM_OFFER_COST_MS = "srOfferCostMs";
 
     private final ArrayList<byte[]> buffer = new ArrayList<>();
     private int batchCount = 0;
@@ -105,10 +130,21 @@ public class StarRocksSinkManager implements Serializable {
     }
 
     public void setRuntimeContext(RuntimeContext runtimeCtx) {
+        totalFlushCount = runtimeCtx.getMetricGroup().counter(COUNTER_TOTAL_FLUSH_COUNT);
         totalFlushBytes = runtimeCtx.getMetricGroup().counter(COUNTER_TOTAL_FLUSH_BYTES);
         totalFlushRows = runtimeCtx.getMetricGroup().counter(COUNTER_TOTAL_FLUSH_ROWS);
         totalFlushTime = runtimeCtx.getMetricGroup().counter(COUNTER_TOTAL_FLUSH_COST_TIME);
         totalFlushTimeWithoutRetries = runtimeCtx.getMetricGroup().counter(COUNTER_TOTAL_FLUSH_COST_TIME_WITHOUT_RETRIES);
+        flushCost = runtimeCtx.getMetricGroup().histogram(HISTOGRAM_FLUSH_COST, new DescriptiveStatisticsHistogram(100));
+        commitAndPublishTimeMs = runtimeCtx.getMetricGroup().histogram(HISTOGRAM_COMMIT_AND_PUBLISH_TIME_MS, new DescriptiveStatisticsHistogram(100));
+        streamLoadPutTimeMs = runtimeCtx.getMetricGroup().histogram(HISTOGRAM_STREAM_LOAD_PUT_TIME_MS, new DescriptiveStatisticsHistogram(100));
+        readDataTimeMs = runtimeCtx.getMetricGroup().histogram(HISTOGRAM_READ_DATA_TIME_IN_MS, new DescriptiveStatisticsHistogram(100));
+        writeDataTimeMs = runtimeCtx.getMetricGroup().histogram(HISTOGRAM_WRITE_DATA_TIME_IN_MS, new DescriptiveStatisticsHistogram(100));
+        loadTimeMs = runtimeCtx.getMetricGroup().histogram(HISTOGRAM_LOAD_TIME_IN_MS, new DescriptiveStatisticsHistogram(100));
+        totalFilteredRows = runtimeCtx.getMetricGroup().counter(COUNTER_TOTAL_FILTERED_ROWS);
+        totalFlushErrorCount = runtimeCtx.getMetricGroup().counter(COUNTER_TOTAL_FLUSH_ERROR);
+        totalOfferTimoutCount = runtimeCtx.getMetricGroup().counter(COUNTER_TOTAL_OFFER_TIMEOUT);
+        offerCostMs = runtimeCtx.getMetricGroup().histogram(HISTOGRAM_OFFER_COST_MS, new DescriptiveStatisticsHistogram(100));
     }
 
     public void startAsyncFlushing() {
@@ -253,7 +289,11 @@ public class StarRocksSinkManager implements Serializable {
     }
 
     private void offer(Tuple3<String, Long, ArrayList<byte[]>> tuple3) throws InterruptedException{
-        if (!flushQueue.offer(tuple3, sinkOptions.getSinkOfferTimeout(), TimeUnit.MILLISECONDS)) {
+        long start = System.currentTimeMillis();
+        boolean offer = flushQueue.offer(tuple3, sinkOptions.getSinkOfferTimeout(), TimeUnit.MILLISECONDS);
+        offerCostMs.update(System.currentTimeMillis() - start);
+        if (!offer) {
+            totalOfferTimoutCount.inc();
             throw new RuntimeException(
                 "Timeout while offering data to flushQueue, exceed " + sinkOptions.getSinkOfferTimeout() + " ms, see " +
                     StarRocksSinkOptions.SINK_BATCH_OFFER_TIMEOUT.key());
@@ -272,20 +312,31 @@ public class StarRocksSinkManager implements Serializable {
             try {
                 long start = System.nanoTime();
                 // flush to StarRocks with stream load
-                starrocksStreamLoadVisitor.doStreamLoad(flushData);
+                Map<String, Object> result = starrocksStreamLoadVisitor.doStreamLoad(flushData);
                 LOG.info(String.format("Async stream load finished: label[%s].", flushData.f0));
                 // metrics
                 if (null != totalFlushBytes) {
+                    totalFlushCount.inc();
                     totalFlushBytes.inc(flushData.f1);
                     totalFlushRows.inc(flushData.f2.size());
                     totalFlushTime.inc(System.nanoTime() - startWithRetries);
                     totalFlushTimeWithoutRetries.inc(System.nanoTime() - start);
+                    flushCost.update(System.nanoTime() - start);
+                    if (result != null) {
+                        updateHisto(result, "CommitAndPublishTimeMs", this.commitAndPublishTimeMs);
+                        updateHisto(result, "StreamLoadPutTimeMs", this.streamLoadPutTimeMs);
+                        updateHisto(result, "ReadDataTimeMs", this.readDataTimeMs);
+                        updateHisto(result, "WriteDataTimeMs", this.writeDataTimeMs);
+                        updateHisto(result, "LoadTimeMs", this.loadTimeMs);
+                        updateCounter(result, "NumberFilteredRows", this.totalFilteredRows);
+                    }
                 }
                 startScheduler();
                 break;
             } catch (Exception e) {
                 LOG.warn("Failed to flush batch data to StarRocks, retry times = {}", i, e);
                 if (i >= sinkOptions.getSinkMaxRetries()) {
+                    totalFlushErrorCount.inc();
                     throw new IOException(e);
                 }
                 try {
@@ -293,6 +344,34 @@ public class StarRocksSinkManager implements Serializable {
                 } catch (InterruptedException ex) {
                     Thread.currentThread().interrupt();
                     throw new IOException("Unable to flush, interrupted while doing another attempt", e);
+                }
+            }
+        }
+    }
+
+    private void updateCounter(Map<String, Object> result, String key, Counter counter) {
+        if (result.containsKey(key)) {
+            Object val = result.get(key);
+            if (val != null) {
+                try {
+                    long longValue = Long.parseLong(val.toString());
+                    counter.inc(longValue);
+                } catch (Exception e) {
+                    LOG.warn("Parse stream load result metric error:", e);
+                }
+            }
+        }
+    }
+
+    private void updateHisto(Map<String, Object> result, String key, Histogram histogram) {
+        if (result.containsKey(key)) {
+            Object val = result.get(key);
+            if (val != null) {
+                try {
+                    long longValue = Long.parseLong(val.toString());
+                    histogram.update(longValue);
+                } catch (Exception e) {
+                    LOG.warn("Parse stream load result metric error:", e);
                 }
             }
         }
