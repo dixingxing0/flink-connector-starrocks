@@ -121,6 +121,7 @@ public class StarRocksStreamLoadVisitor implements Serializable {
             LOG.warn("Load error log failed.", e);
             return null;
         }
+        return loadResult;
     }
 
     private String getAvailableHost() {
